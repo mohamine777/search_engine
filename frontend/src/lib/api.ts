@@ -112,3 +112,74 @@ export async function reindexDocument(docId: string) {
 export async function submitFeedback(_query: string, _docId: string, _relevant: boolean) {
   return { success: true };
 }
+
+// ── Evaluation types & functions ────────────────────────────────────
+
+export type ModelMetrics = {
+  precision: number;
+  recall: number;
+  f1: number;
+  vp: number;
+  fp: number;
+  fn: number;
+  retrieved_count: number;
+  retrieved_doc_ids: string[];
+};
+
+export type PerQueryResult = {
+  query: string;
+  relevant_count: number;
+  relevant_doc_ids: string[];
+  models: Record<string, ModelMetrics>;
+};
+
+export type GlobalMetrics = {
+  avg_precision: number;
+  avg_recall: number;
+  avg_f1: number;
+};
+
+export type EvaluationReport = {
+  per_query: PerQueryResult[];
+  global: Record<string, GlobalMetrics>;
+  top_k: number;
+  query_count: number;
+};
+
+export type GroundTruthData = {
+  queries: string[];
+  query_count: number;
+  judgments: Record<string, string[]>;
+};
+
+export async function runEvaluation(payload: {
+  queries?: string[];
+  top_k?: number;
+  measure?: string;
+}): Promise<EvaluationReport> {
+  const response = await request("/evaluate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return response.json();
+}
+
+export async function fetchGroundTruth(): Promise<GroundTruthData> {
+  const response = await request("/ground-truth", { cache: "no-store" });
+  return response.json();
+}
+
+export async function updateGroundTruth(judgments: Record<string, string[]>): Promise<GroundTruthData> {
+  const response = await request("/ground-truth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ judgments }),
+  });
+  return response.json();
+}
+
+export async function autoGenerateGroundTruth(): Promise<GroundTruthData> {
+  const response = await request("/ground-truth/auto-generate", { method: "POST" });
+  return response.json();
+}

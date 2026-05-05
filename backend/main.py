@@ -11,12 +11,14 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import List, Literal
+from typing import Dict, List, Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from evaluation.evaluator import Evaluator
+from evaluation.ground_truth import GroundTruth
 from indexer import Indexer
 from models.bir_model import BIRModel
 from models.vsm_model import VectorSpaceModel
@@ -40,6 +42,20 @@ indexer = Indexer(DATA_DIR / "index.json")
 vsm_model = VectorSpaceModel(indexer)
 bir_model = BIRModel(indexer)
 
+# ── Evaluation ───────────────────────────────────────────────────────
+ground_truth = GroundTruth(DATA_DIR / "ground_truth.json")
+
+DEFAULT_EVAL_QUERIES = [
+    "recherche information index inverse",
+    "vector space model TF-IDF cosine",
+    "probabilistic retrieval BIR Robertson",
+    "boolean query AND OR NOT",
+    "evaluation precision recall",
+    "pretraitement tokenisation racinisation",
+    "fuzzy retrieval membership",
+    "FastAPI backend search engine",
+]
+
 
 # ── Request / response schemas ───────────────────────────────────────
 
@@ -56,6 +72,16 @@ class IndexResponse(BaseModel):
     total_documents: int
 
 
+class EvaluateRequest(BaseModel):
+    queries: Optional[List[str]] = Field(None, description="Queries to evaluate. If omitted, use all ground truth queries.")
+    top_k: int = Field(10, ge=1, le=100, description="Number of results to evaluate per model.")
+    measure: str = Field("cosine", description="VSM similarity measure to use.")
+
+
+class GroundTruthUpdate(BaseModel):
+    judgments: Dict[str, List[str]] = Field(..., description="Mapping of query text → list of relevant doc IDs.")
+
+
 # ── Lifecycle ────────────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -65,6 +91,10 @@ def startup() -> None:
     loaded = indexer.load()
     if not loaded or indexer.document_count == 0:
         indexer.index_paths(SAMPLE_DIR.glob("*.txt"), clear=True)
+    # Load or auto-generate ground truth
+    if not ground_truth.load():
+        ground_truth.auto_generate(DEFAULT_EVAL_QUERIES, indexer)
+        ground_truth.save()
 
 
 # ── Health ───────────────────────────────────────────────────────────
@@ -221,6 +251,67 @@ def suggest(q: str = "", limit: int = 8) -> List[str]:
         return [item["term"] for item in indexer.top_terms(limit)]
     matches = [term for term in indexer.vocabulary if term.startswith(prefix)]
     return matches[:limit]
+
+
+# ── Evaluation ───────────────────────────────────────────────────────
+
+@app.post("/evaluate")
+def evaluate(payload: EvaluateRequest) -> dict:
+    """Run VSM and BIR on ground truth queries and return IR metrics."""
+    def vsm_search(q: str) -> List[dict]:
+        return vsm_model.search(q, measure=payload.measure)
+
+    def bir_search(q: str) -> List[dict]:
+        return bir_model.search(q)
+
+    evaluator = Evaluator(
+        ground_truth=ground_truth,
+        models={"vsm": vsm_search, "bir": bir_search},
+        top_k=payload.top_k,
+    )
+    return evaluator.evaluate_all(queries=payload.queries)
+
+
+@app.get("/ground-truth")
+def get_ground_truth() -> dict:
+    """Return current ground truth relevance judgments."""
+    return {
+        "queries": ground_truth.queries,
+        "query_count": len(ground_truth.queries),
+        "judgments": ground_truth.to_dict(),
+    }
+
+
+@app.post("/ground-truth")
+def update_ground_truth(payload: GroundTruthUpdate) -> dict:
+    """Replace ground truth judgments for the given queries."""
+    for query_text, doc_ids in payload.judgments.items():
+        # Validate that doc IDs exist
+        unknown = [d for d in doc_ids if d not in indexer.documents]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown doc IDs for query '{query_text}': {unknown}",
+            )
+        ground_truth.set_relevant(query_text, doc_ids)
+    ground_truth.save()
+    return {
+        "success": True,
+        "query_count": len(ground_truth.queries),
+        "judgments": ground_truth.to_dict(),
+    }
+
+
+@app.post("/ground-truth/auto-generate")
+def auto_generate_ground_truth() -> dict:
+    """Regenerate ground truth from the inverted index heuristic."""
+    ground_truth.auto_generate(DEFAULT_EVAL_QUERIES, indexer)
+    ground_truth.save()
+    return {
+        "success": True,
+        "query_count": len(ground_truth.queries),
+        "judgments": ground_truth.to_dict(),
+    }
 
 
 # ── Private helpers ──────────────────────────────────────────────────
